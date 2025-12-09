@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from typing import Dict, Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -49,16 +49,27 @@ async def send_json(ws: WebSocket, payload: dict) -> None:
 async def broadcast(room_id: str, payload: dict, skip: Optional[str] = None) -> None:
     # send to everyone in room except "skip"
     players = rooms.get(room_id, {})
-    to_remove = []
-    for pid, p in players.items():
-        if skip and pid == skip:
-            continue
+    targets = [
+        (pid, p.websocket)
+        for pid, p in players.items()
+        if not (skip and pid == skip)
+    ]
+    if not targets:
+        return
+
+    async def _send(pid_ws):
+        pid, ws = pid_ws
         try:
-            await send_json(p.websocket, payload)
+            await send_json(ws, payload)
+            return None
         except Exception:
-            to_remove.append(pid)
-    for pid in to_remove:
-        players.pop(pid, None)
+            return pid
+
+    results = await asyncio.gather(*(_send(t) for t in targets))
+    # prune any failed sockets
+    for pid in results:
+        if pid:
+            players.pop(pid, None)
 
 
 async def send_state(ws: WebSocket, room_id: str, your_id: str) -> None:
