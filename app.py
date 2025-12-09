@@ -49,16 +49,31 @@ async def send_json(ws: WebSocket, payload: dict) -> None:
 async def broadcast(room_id: str, payload: dict, skip: Optional[str] = None) -> None:
     # send to everyone in room except "skip"
     players = rooms.get(room_id, {})
-    to_remove = []
+    tasks = []
     for pid, p in players.items():
         if skip and pid == skip:
             continue
-        try:
-            await send_json(p.websocket, payload)
-        except Exception:
-            to_remove.append(pid)
-    for pid in to_remove:
-        players.pop(pid, None)
+        tasks.append(send_json(p.websocket, payload))
+
+    if not tasks:
+        return
+
+    done, pending = await asyncio.wait(tasks, return_when=asyncio.ALL_COMPLETED)
+    # Cleanup any failed sockets
+    failures = []
+    for task in done:
+        if task.exception():
+            try:
+                ws = task.get_coro().cr_frame.f_locals.get("ws")  # best-effort
+            except Exception:
+                ws = None
+            failures.append(ws)
+
+    if failures:
+        players = rooms.get(room_id, {})
+        stale_ids = [pid for pid, p in players.items() if p.websocket in failures]
+        for pid in stale_ids:
+            players.pop(pid, None)
 
 
 async def send_state(ws: WebSocket, room_id: str, your_id: str) -> None:
