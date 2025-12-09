@@ -47,24 +47,14 @@ async def send_json(ws: WebSocket, payload: dict) -> None:
 
 
 async def broadcast(room_id: str, payload: dict, skip: Optional[str] = None) -> None:
+    # send to everyone in room except "skip"
     players = rooms.get(room_id, {})
-    tasks = []
     to_remove = []
     for pid, p in players.items():
         if skip and pid == skip:
             continue
-        tasks.append(send_json(p.websocket, payload))
-    if tasks:
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.ALL_COMPLETED)
-        for task in done:
-            if task.exception():
-                # identify websocket failures by matching order
-                # fallback: we clean up in the loop below
-                pass
-    for pid, p in list(players.items()):
         try:
-            if p.websocket.client_state.name != "CONNECTED":
-                to_remove.append(pid)
+            await send_json(p.websocket, payload)
         except Exception:
             to_remove.append(pid)
     for pid in to_remove:
@@ -118,7 +108,6 @@ async def ws_endpoint(ws: WebSocket):
                     )
 
                 await send_state(ws, room_id, player_id)
-                # Notify others of this new/returned player with full payload
                 await broadcast(
                     room_id,
                     {
@@ -134,12 +123,6 @@ async def ws_endpoint(ws: WebSocket):
                     },
                     skip=player_id,
                 )
-                # Also push a fresh state snapshot to everyone (helps late joiners)
-                for _, p in list(rooms.get(room_id, {}).items()):
-                    try:
-                        await send_state(p.websocket, room_id, p.player_id)
-                    except Exception:
-                        pass
 
             elif msg_type == "update" and room_id and player_id:
                 x = float(msg.get("x", 0))
@@ -149,23 +132,9 @@ async def ws_endpoint(ws: WebSocket):
                     if player:
                         player.x = x
                         player.y = y
-                        # keep latest meta too
-                        player.name = msg.get("name", player.name)
-                        player.shape = msg.get("shape", player.shape)
-                        player.color = msg.get("color", player.color)
                 await broadcast(
                     room_id,
-                    {
-                        "type": "update",
-                        "player": {
-                            "player_id": player_id,
-                            "name": msg.get("name"),
-                            "shape": msg.get("shape"),
-                            "color": msg.get("color"),
-                            "x": x,
-                            "y": y,
-                        },
-                    },
+                    {"type": "update", "player": {"player_id": player_id, "x": x, "y": y}},
                     skip=player_id,
                 )
     except WebSocketDisconnect:
