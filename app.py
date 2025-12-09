@@ -118,6 +118,7 @@ async def ws_endpoint(ws: WebSocket):
                     )
 
                 await send_state(ws, room_id, player_id)
+                # Notify others of this new/returned player with full payload
                 await broadcast(
                     room_id,
                     {
@@ -133,6 +134,12 @@ async def ws_endpoint(ws: WebSocket):
                     },
                     skip=player_id,
                 )
+                # Also push a fresh state snapshot to everyone (helps late joiners)
+                for _, p in list(rooms.get(room_id, {}).items()):
+                    try:
+                        await send_state(p.websocket, room_id, p.player_id)
+                    except Exception:
+                        pass
 
             elif msg_type == "update" and room_id and player_id:
                 x = float(msg.get("x", 0))
@@ -142,9 +149,23 @@ async def ws_endpoint(ws: WebSocket):
                     if player:
                         player.x = x
                         player.y = y
+                        # keep latest meta too
+                        player.name = msg.get("name", player.name)
+                        player.shape = msg.get("shape", player.shape)
+                        player.color = msg.get("color", player.color)
                 await broadcast(
                     room_id,
-                    {"type": "update", "player": {"player_id": player_id, "x": x, "y": y}},
+                    {
+                        "type": "update",
+                        "player": {
+                            "player_id": player_id,
+                            "name": msg.get("name"),
+                            "shape": msg.get("shape"),
+                            "color": msg.get("color"),
+                            "x": x,
+                            "y": y,
+                        },
+                    },
                     skip=player_id,
                 )
     except WebSocketDisconnect:
