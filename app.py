@@ -1,18 +1,21 @@
 from __future__ import annotations
 
-import time
-from dataclasses import dataclass, asdict
-from typing import Dict, List
+import asyncio
+import json
+from dataclasses import asdict, dataclass
+from typing import Dict, Optional
 
-from flask import Flask, jsonify, request
-from flask_cors import CORS
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 
-app = Flask(__name__)
-CORS(app)
-
-# In-memory room store. For production, move to a database.
-ROOMS: Dict[str, Dict[str, "Player"]] = {}
-PLAYER_TTL = 35  # seconds of inactivity before removal
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @dataclass
@@ -23,111 +26,137 @@ class Player:
     color: str
     x: float
     y: float
-    last_seen: float
+    websocket: WebSocket
 
 
-def now() -> float:
-    return time.time()
+# rooms[room_id] -> {player_id: Player}
+rooms: Dict[str, Dict[str, Player]] = {}
+room_locks: Dict[str, asyncio.Lock] = {}
 
 
-def cleanup_room(room_id: str) -> None:
-    players = ROOMS.get(room_id)
-    if not players:
-        return
-    cutoff = now() - PLAYER_TTL
-    stale = [pid for pid, p in players.items() if p.last_seen < cutoff]
-    for pid in stale:
+def get_lock(room_id: str) -> asyncio.Lock:
+    lock = room_locks.get(room_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        room_locks[room_id] = lock
+    return lock
+
+
+async def send_json(ws: WebSocket, payload: dict) -> None:
+    await ws.send_text(json.dumps(payload))
+
+
+async def broadcast(room_id: str, payload: dict, skip: Optional[str] = None) -> None:
+    # send to everyone in room except "skip"
+    players = rooms.get(room_id, {})
+    to_remove = []
+    for pid, p in players.items():
+        if skip and pid == skip:
+            continue
+        try:
+            await send_json(p.websocket, payload)
+        except Exception:
+            to_remove.append(pid)
+    for pid in to_remove:
         players.pop(pid, None)
-    if not players:
-        ROOMS.pop(room_id, None)
 
 
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok"}), 200
-
-
-@app.route("/rooms/<room_id>/join", methods=["POST"])
-def join_room(room_id: str):
-    data = request.get_json(force=True, silent=True) or {}
-    player_id = data.get("player_id")
-    if not player_id:
-        return jsonify({"error": "player_id required"}), 400
-
-    name = data.get("name", "player")
-    shape = data.get("shape", "square")
-    color = data.get("color", "#00ff00")
-
-    room = ROOMS.setdefault(room_id, {})
-    room[player_id] = Player(
-        player_id=player_id,
-        name=name,
-        shape=shape,
-        color=color,
-        x=data.get("x", 120.0),
-        y=data.get("y", 120.0),
-        last_seen=now(),
-    )
-    cleanup_room(room_id)
-    return jsonify({"ok": True, "room": room_id})
-
-
-@app.route("/rooms/<room_id>/update", methods=["POST"])
-def update_position(room_id: str):
-    data = request.get_json(force=True, silent=True) or {}
-    player_id = data.get("player_id")
-    if not player_id:
-        return jsonify({"error": "player_id required"}), 400
-    x = float(data.get("x", 0))
-    y = float(data.get("y", 0))
-
-    room = ROOMS.setdefault(room_id, {})
-    player = room.get(player_id)
-    if not player:
-        # Treat as implicit join with defaults
-        room[player_id] = Player(
-            player_id=player_id,
-            name=data.get("name", "player"),
-            shape=data.get("shape", "square"),
-            color=data.get("color", "#00ff00"),
-            x=x,
-            y=y,
-            last_seen=now(),
+async def send_state(ws: WebSocket, room_id: str, your_id: str) -> None:
+    snapshot = []
+    for pid, p in rooms.get(room_id, {}).items():
+        snapshot.append(
+            {
+                "player_id": pid,
+                "name": p.name,
+                "shape": p.shape,
+                "color": p.color,
+                "x": p.x,
+                "y": p.y,
+            }
         )
-    else:
-        player.x = x
-        player.y = y
-        player.last_seen = now()
-
-    cleanup_room(room_id)
-    return jsonify({"ok": True})
+    await send_json(ws, {"type": "state", "room": room_id, "players": snapshot, "you": your_id})
 
 
-@app.route("/rooms/<room_id>/state", methods=["GET"])
-def room_state(room_id: str):
-    player_id = request.args.get("player_id")
-    cleanup_room(room_id)
-    players = ROOMS.get(room_id, {})
-    payload: List[dict] = []
-    for pid, player in players.items():
-        payload.append(asdict(player))
-    return jsonify({"room": room_id, "players": payload, "you": player_id})
+@app.websocket("/ws")
+async def ws_endpoint(ws: WebSocket):
+    await ws.accept()
+    room_id: Optional[str] = None
+    player_id: Optional[str] = None
+    try:
+        while True:
+            raw = await ws.receive_text()
+            msg = json.loads(raw)
+            msg_type = msg.get("type")
+
+            if msg_type == "join":
+                room_id = msg.get("room")
+                player_id = msg.get("player_id")
+                if not room_id or not player_id:
+                    await send_json(ws, {"type": "error", "message": "room and player_id required"})
+                    continue
+
+                async with get_lock(room_id):
+                    players = rooms.setdefault(room_id, {})
+                    players[player_id] = Player(
+                        player_id=player_id,
+                        name=msg.get("name", "player"),
+                        shape=msg.get("shape", "square"),
+                        color=msg.get("color", "#00ff00"),
+                        x=float(msg.get("x", 120)),
+                        y=float(msg.get("y", 120)),
+                        websocket=ws,
+                    )
+
+                await send_state(ws, room_id, player_id)
+                await broadcast(
+                    room_id,
+                    {
+                        "type": "update",
+                        "player": {
+                            "player_id": player_id,
+                            "name": msg.get("name", "player"),
+                            "shape": msg.get("shape", "square"),
+                            "color": msg.get("color", "#00ff00"),
+                            "x": msg.get("x", 120),
+                            "y": msg.get("y", 120),
+                        },
+                    },
+                    skip=player_id,
+                )
+
+            elif msg_type == "update" and room_id and player_id:
+                x = float(msg.get("x", 0))
+                y = float(msg.get("y", 0))
+                async with get_lock(room_id):
+                    player = rooms.get(room_id, {}).get(player_id)
+                    if player:
+                        player.x = x
+                        player.y = y
+                await broadcast(
+                    room_id,
+                    {"type": "update", "player": {"player_id": player_id, "x": x, "y": y}},
+                    skip=player_id,
+                )
+    except WebSocketDisconnect:
+        pass
+    finally:
+        if room_id and player_id:
+            async with get_lock(room_id):
+                players = rooms.get(room_id)
+                if players and player_id in players:
+                    players.pop(player_id, None)
+                    if not players:
+                        rooms.pop(room_id, None)
+            await broadcast(room_id, {"type": "leave", "player_id": player_id}, skip=None)
 
 
-@app.route("/rooms/<room_id>/leave", methods=["POST"])
-def leave_room(room_id: str):
-    data = request.get_json(force=True, silent=True) or {}
-    player_id = data.get("player_id")
-    if not player_id:
-        return jsonify({"error": "player_id required"}), 400
-    room = ROOMS.get(room_id)
-    if room:
-        room.pop(player_id, None)
-        if not room:
-            ROOMS.pop(room_id, None)
-    return jsonify({"ok": True})
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    import uvicorn
+
+    uvicorn.run("app:app", host="0.0.0.0", port=5000, reload=True)
 
